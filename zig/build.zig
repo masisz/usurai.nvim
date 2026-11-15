@@ -1,6 +1,7 @@
 const std = @import("std");
 
-// NOTE: `src/search.zig`, `src/os.zig`, and `src/search_test.zig` are managed in
+// NOTE: `src/search.zig`, `src/os.zig`, `src/search_test.zig`, `src/fuzzy.zig`, and
+// `src/fuzzy_test.zig` are managed in
 // `rufio/lib_zig/rufio_native/src/` as the Single Source of Truth.
 // Run `rake native:sync_nvim` (or `make -C lib_zig/rufio_native sync-nvim`) in `rufio` to sync.
 
@@ -93,6 +94,14 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    const test_step = b.step("test", "Run unit tests for the Zig search engine");
+    const test_step = b.step("test", "Run unit tests for the Zig search and fuzzy engines");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    const fuzzy_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzzy_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(fuzzy_tests).step);
 }

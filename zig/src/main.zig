@@ -1,6 +1,11 @@
 const std = @import("std");
 const search = @import("search.zig");
 
+// Fuzzy matcher (core_fuzzy_*): its exports live in fuzzy.zig.
+comptime {
+    _ = @import("fuzzy.zig");
+}
+
 // ============================================================
 // C ABI Exports for LuaJIT FFI (masisz.nvim) & Ruby Fiddle (rufio)
 // ============================================================
