@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  zig-engine:
+    name: Zig Native Search Engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Run Zig unit tests
+        working-directory: zig
+        run: zig build test
+
+      - name: Build shared library (ReleaseFast)
+        working-directory: zig
+        run: zig build -Doptimize=ReleaseFast
+
+  nvim-check:
+    name: Neovim Smoke Test & Healthcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Build Zig shared library
+        working-directory: zig
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Setup Neovim (nightly)
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: nightly
+
+      - name: Verify usurai.nvim modules and Zig FFI load
+        run: |
+          nvim --headless --cmd "set rtp+=." \
+            -c "lua require('usurai.config').pre_init()" \
+            -c "lua assert(require('usurai.config.zig_search').is_available(), 'Zig FFI failed to load')" \
+            -c "lua require('usurai.health').check()" \
+            -c "qa"
