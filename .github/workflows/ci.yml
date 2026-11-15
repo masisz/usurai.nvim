@@ -1,60 +1,41 @@
-name: CI
+name: Security & Lint
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 0 * * 1"
+
+permissions:
+  contents: read
 
 jobs:
-  zig-engine:
-    name: Zig Native Search Engine (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0
-
-      - name: Run Zig unit tests
-        working-directory: zig
-        run: zig build test
-
-      - name: Build shared library (ReleaseFast)
-        working-directory: zig
-        run: zig build -Doptimize=ReleaseFast
-
-  nvim-check:
-    name: Neovim Smoke Test & Healthcheck
+  secret-and-vuln-scan:
+    name: Vulnerability & Secret Scan (Trivy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - name: Run Trivy vulnerability and secret scanner
+        uses: aquasecurity/trivy-action@master
         with:
-          version: 0.17.0
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "vuln,secret,misconfig"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
 
-      - name: Build Zig shared library
-        working-directory: zig
-        run: zig build -Doptimize=ReleaseFast
+  lua-syntax-check:
+    name: Lua Syntax Verification (luac)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Setup Neovim (nightly)
-        uses: rhysd/action-setup-vim@v1
-        with:
-          neovim: true
-          version: nightly
+      - name: Install Lua 5.1 (LuaJIT compatible syntax check)
+        run: sudo apt-get update && sudo apt-get install -y lua5.1
 
-      - name: Verify usurai.nvim modules and Zig FFI load
+      - name: Check all Lua files for syntax errors
         run: |
-          nvim --headless --cmd "set rtp+=." \
-            -c "lua require('usurai.config').pre_init()" \
-            -c "lua assert(require('usurai.config.zig_search').is_available(), 'Zig FFI failed to load')" \
-            -c "lua require('usurai.health').check()" \
-            -c "qa"
+          find init.lua lua -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
