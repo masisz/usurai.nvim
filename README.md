@@ -19,7 +19,8 @@ Just like LazyVim, you can install it from your `~/.config/nvim` with a single l
 - **Built on Native Neovim 0.12+ Features**:
   - Replaces external completion engines (`nvim-cmp`) and snippet plugins (`LuaSnip`) with Neovim's built-in **`vim.lsp.completion` (with Fuzzy & Popup support)** and **`vim.snippet`**.
 - **Bundled Zig Native Search Engine (Prebuilt binaries included — no `zig`, `fd`, or `rg` required)**:
-  - Ships with the parallel directory walker and 32-byte SIMD search engine (`zig/src/search.zig`, `os.zig`) shared with [masisz/rufio](https://github.com/masisz/rufio).
+  - Ships with the parallel directory walker and 32-byte SIMD search engine (`zig/src/search.zig`, `os.zig`) and the fuzzy matcher (`fuzzy.zig`) shared with [masisz/rufio](https://github.com/masisz/rufio).
+  - Live Grep can fuzzy-filter its hits: type `pattern  filter` (two spaces) to grep `pattern` literally, then rank the hits by a fuzzy match of `filter` against `path:line:col:text` (e.g. `def  fzsess`).
   - Includes **prebuilt shared libraries (`zig/prebuilt/`) for all major platforms** (macOS Apple Silicon / Intel, Linux x86_64 / ARM64, Windows x86_64 / ARM64), so it works out-of-the-box right after `git clone` without needing the Zig compiler installed.
   - Calls the shared library (`librufio_zig`) directly from Neovim's **LuaJIT FFI**. Combined with an **in-process 256MB in-memory file cache**, it delivers zero-subprocess, sub-millisecond file search and live grep.
 - **`snacks.nvim` at the Core of Search & View**:
@@ -120,9 +121,10 @@ usurai.nvim/
 │   ├── build.zig                         # `zig build` / `zig build prebuild` (cross-compiles all targets)
 │   ├── prebuilt/                         # Prebuilt shared libraries for immediate out-of-the-box use
 │   └── src/
+│       ├── fuzzy.zig                     # Fuzzy matcher shared with rufio (top-K, UTF-8)
 │       ├── os.zig                        # OS abstraction (macOS getattrlistbulk / Linux getdents64 / Win32 FindFirstFileExW)
 │       ├── search.zig                    # Parallel walker, 32-byte SIMD search & in-memory cache
-│       └── main.zig                      # C ABI exports (core_search_*, core_files_*, core_cache_*)
+│       └── main.zig                      # C ABI exports (core_search_*, core_files_*, core_cache_*, core_fuzzy_*)
 ├── lua/
 │   └── usurai/
 │       ├── init.lua                      # require("usurai").setup(opts)
@@ -160,7 +162,7 @@ The `<leader>` key is `<Space>`.
 | Key | Action | Plugin |
 | :--- | :--- | :--- |
 | `<leader><space>` / `<leader>ff` | Find files (Zig FFI / Snacks) | `snacks.picker` |
-| `<leader>/` / `<leader>sg` | Live Grep across project (Zig SIMD) | `snacks.picker` |
+| `<leader>/` / `<leader>sg` | Live Grep across project (Zig SIMD; `pattern  filter` fuzzy-filters hits) | `snacks.picker` |
 | `<leader>,` / `<leader>fb` | Open buffers | `snacks.picker` |
 | `<leader>fr` | Recent files | `snacks.picker` |
 | `<leader>sw` | Grep word under cursor / visual selection | `snacks.picker` |

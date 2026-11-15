@@ -93,9 +93,23 @@ if ffi_ok then
     uint64_t core_cache_create(uint64_t max_bytes);
     uint64_t core_cache_bytes(uint64_t handle);
     void core_cache_destroy(uint64_t handle);
+    uint64_t core_fuzzy_create(void);
+    int32_t core_fuzzy_add(uint64_t handle, const uint8_t *data, size_t length);
+    int32_t core_fuzzy_query(uint64_t handle, const uint8_t *data, size_t length, uint32_t limit);
+    const uint8_t *core_fuzzy_results(uint64_t handle, size_t *length);
+    void core_fuzzy_destroy(uint64_t handle);
   ]]
   )
 end
+
+-- Limits enforced by fuzzy.zig (MAX_QUERY_BYTES / MAX_CANDIDATE_BYTES / MAX_RESULTS)
+local FUZZY_MAX_QUERY_BYTES = 1024
+local FUZZY_MAX_CANDIDATE_BYTES = 65536
+local FUZZY_MAX_RESULTS = 10000
+
+--- Separator between the grep pattern and the fuzzy filter in `pick_grep`
+--- (two spaces, so a single space can still be grepped literally).
+M.FUZZY_SEPARATOR = "  "
 
 local function lib_filename()
   if os_config.is_mac then
@@ -356,6 +370,144 @@ function M.scan_files(cwd, max_items)
   return items
 end
 
+--- Split a grep prompt into the literal grep pattern and the fuzzy filter.
+--- `"render  fzsess"` -> `"render", "fzsess"`; without the separator the filter is `""`.
+---@param input string
+---@return string pattern, string filter
+function M.split_query(input)
+  local at = input:find(M.FUZZY_SEPARATOR, 1, true)
+  if not at then
+    return input, ""
+  end
+  local filter = input:sub(at + #M.FUZZY_SEPARATOR):gsub("^%s+", ""):gsub("%s+$", "")
+  return input:sub(1, at - 1), filter
+end
+
+--- Replace bytes that are not valid UTF-8 (and NUL) with "?", since fuzzy.zig rejects them.
+local function sanitize_utf8(text)
+  if not text:find("[%z\128-\255]") then
+    return text
+  end
+  local out = {}
+  local i, n = 1, #text
+  while i <= n do
+    local b = text:byte(i)
+    local len = b < 0x80 and 1 or b >= 0xC2 and b <= 0xDF and 2 or b >= 0xE0 and b <= 0xEF and 3
+      or b >= 0xF0 and b <= 0xF4 and 4 or 0
+    local ok = len > 0 and i + len - 1 <= n
+    if ok and len > 1 then
+      for k = i + 1, i + len - 1 do
+        local c = text:byte(k)
+        if c < 0x80 or c > 0xBF then
+          ok = false
+          break
+        end
+      end
+      if ok then
+        local b2 = text:byte(i + 1)
+        -- overlong / surrogate / out-of-range sequences
+        if
+          (b == 0xE0 and b2 < 0xA0)
+          or (b == 0xED and b2 > 0x9F)
+          or (b == 0xF0 and b2 < 0x90)
+          or (b == 0xF4 and b2 > 0x8F)
+        then
+          ok = false
+        end
+      end
+    end
+    if ok and b ~= 0 then
+      out[#out + 1] = text:sub(i, i + len - 1)
+      i = i + len
+    else
+      out[#out + 1] = "?"
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
+--- Prepare a string for fuzzy.zig: valid UTF-8, no NUL, at most `max_bytes` bytes
+--- (cut on a character boundary).
+local function fuzzy_text(text, max_bytes)
+  text = sanitize_utf8(text)
+  if #text > max_bytes then
+    local cut = max_bytes
+    while cut > 0 and text:byte(cut + 1) and text:byte(cut + 1) >= 0x80 and text:byte(cut + 1) <= 0xBF do
+      cut = cut - 1
+    end
+    text = text:sub(1, cut)
+  end
+  return text
+end
+
+--- Fuzzy-filter `items` with the Zig engine shared with rufio (fuzzy.zig).
+--- Each candidate is `item[key]` (default `item.text`). Returns the matching items,
+--- best score first, or nil when the native library is unavailable.
+---@param items table[]
+---@param query string
+---@param opts? { key?: string, limit?: number }
+---@return table[]?
+function M.fuzzy_filter(items, query, opts)
+  opts = opts or {}
+  local engine = M.load()
+  if not engine then
+    return nil
+  end
+  query = fuzzy_text(query or "", FUZZY_MAX_QUERY_BYTES)
+  if query == "" or #items == 0 then
+    return items
+  end
+  local key = opts.key or "text"
+  local limit = math.min(opts.limit or #items, FUZZY_MAX_RESULTS)
+
+  local handle = engine.core_fuzzy_create()
+  if handle == 0 then
+    return nil
+  end
+
+  local ok, result = pcall(function()
+    local texts = {}
+    for i, item in ipairs(items) do
+      texts[i] = fuzzy_text(tostring(item[key] or ""), FUZZY_MAX_CANDIDATE_BYTES)
+    end
+    local packed = table.concat(texts, "\0") .. "\0"
+    if engine.core_fuzzy_add(handle, packed, #packed) ~= 0 then
+      return nil
+    end
+    if engine.core_fuzzy_query(handle, query, #query, limit) ~= 0 then
+      return nil
+    end
+
+    local len_buf = ffi.new("size_t[1]")
+    local ptr = engine.core_fuzzy_results(handle, len_buf)
+    local total_len = tonumber(len_buf[0]) or 0
+    if ptr == nil or total_len < 12 then
+      return {}
+    end
+    -- Layout: u64 total, u32 count, then per match: u64 id, i64 score, u32 n, n * u32 byte offsets
+    local count = read_u32(ptr, 8)
+    local pos = 12
+    local out = {}
+    for _ = 1, count do
+      if pos + 20 > total_len then
+        break
+      end
+      local id = read_u64_low(ptr, pos)
+      local n = read_u32(ptr, pos + 16)
+      out[#out + 1] = items[id + 1]
+      pos = pos + 20 + n * 4
+    end
+    return out
+  end)
+
+  engine.core_fuzzy_destroy(handle)
+  if not ok then
+    return nil
+  end
+  return result
+end
+
 --- Search file contents in `cwd` using Zig SIMD + in-memory cache (replaces `rg`)
 ---@param query string
 ---@param cwd? string
@@ -452,7 +604,25 @@ function M.pick_files(opts)
   }, opts))
 end
 
---- Open Snacks.picker for Live Grep powered by Zig SIMD + RAM Cache (falls back to Snacks.picker.grep)
+--- Grep with the Zig engine, then fuzzy-filter the hits when the prompt contains
+--- `M.FUZZY_SEPARATOR` (`"pattern  filter"`). The filter matches `path:line:col:text`.
+---@param input string
+---@param cwd? string
+---@param max_items? number
+function M.search_content_fuzzy(input, cwd, max_items)
+  local pattern, filter = M.split_query(input or "")
+  if pattern == "" then
+    return {}
+  end
+  local items = M.search_content(pattern, cwd, max_items)
+  if not items or filter == "" then
+    return items
+  end
+  return M.fuzzy_filter(items, filter) or items
+end
+
+--- Open Snacks.picker for Live Grep powered by Zig SIMD + RAM Cache (falls back to Snacks.picker.grep).
+--- Type `pattern  filter` (two spaces) to fuzzy-filter the grep hits by path and line.
 function M.pick_grep(opts)
   opts = opts or {}
   if not M.is_available() or not (_G.Snacks and Snacks.picker) then
@@ -473,7 +643,7 @@ function M.pick_grep(opts)
       if search == "" then
         return {}
       end
-      return M.search_content(search, cwd) or {}
+      return M.search_content_fuzzy(search, cwd) or {}
     end,
   }, opts))
 end

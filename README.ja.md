@@ -19,7 +19,8 @@ LazyVim と同じように、自分の `~/.config/nvim` から **`{ "masisz/usur
 - **Neovim 0.12+ の標準機能をフル活用**:
   - 補完エンジン（`nvim-cmp` 等）やスニペットプラグイン（`LuaSnip` 等）を排除し、Neovim 標準の **`vim.lsp.completion`（Fuzzy & Popup対応）** と **`vim.snippet`** で軽快に動作します。
 - **Zig ネイティブ検索エンジン（ビルド済みバイナリ同梱・`zig` / `fd` / `rg` インストール不要）**:
-  - [masisz/rufio](https://github.com/masisz/rufio) と共通の並列ディレクトリウォーカー＆32バイト SIMD 検索エンジン（`zig/src/search.zig`, `os.zig`）をプラグイン内に同梱。
+  - [masisz/rufio](https://github.com/masisz/rufio) と共通の並列ディレクトリウォーカー＆32バイト SIMD 検索エンジン（`zig/src/search.zig`, `os.zig`）と曖昧検索エンジン（`fuzzy.zig`）をプラグイン内に同梱。
+  - Live Grep の結果を曖昧検索で絞り込めます。`パターン  フィルタ`（空白 2 つで区切る）と入力すると、`パターン` をそのまま grep し、その結果を `パス:行:桁:本文` に対する `フィルタ` の曖昧一致でスコア順に並べます（例: `def  fzsess`）。
   - 主要 OS・アーキテクチャ向け（macOS Apple Silicon / Intel、Linux x86_64 / ARM64、Windows x86_64 / ARM64）の**ビルド済みバイナリ（`zig/prebuilt/`）をリポジトリに同梱**しているため、`git clone` した瞬間から Zig コンパイラすら不要で即座に動作します。
   - Neovim の **LuaJIT FFI** から動的ライブラリ（`librufio_zig`）を直接呼び出し、さらに **256MB のオンメモリファイルキャッシュ**をプロセス内に保持するため、外部プロセス起動ゼロ・数ミリ秒での超高速ファイル検索＆Live Grepが動作します。
 - **Search & View の中核に `snacks.nvim` を採用**:
@@ -120,9 +121,10 @@ usurai.nvim/
 │   ├── build.zig                         # `zig build` / `zig build prebuild`（全OS向けクロスビルド）
 │   ├── prebuilt/                         # git clone 後すぐ使える各OS・CPU向けビルド済みバイナリ
 │   └── src/
+│       ├── fuzzy.zig                     # rufio と共通の曖昧検索エンジン（top-K・UTF-8 対応）
 │       ├── os.zig                        # OS抽象層（macOS getattrlistbulk / Linux getdents64 / Win32 FindFirstFileExW）
 │       ├── search.zig                    # 並列ウォーカー・32byte SIMD 検索・インメモリ Cache
-│       └── main.zig                      # C ABI エクスポート（core_search_*, core_files_*, core_cache_*）
+│       └── main.zig                      # C ABI エクスポート（core_search_*, core_files_*, core_cache_*, core_fuzzy_*）
 ├── lua/
 │   └── usurai/
 │       ├── init.lua                      # require("usurai").setup(opts)
@@ -160,7 +162,7 @@ usurai.nvim/
 | キー | 動作 | プラグイン |
 | :--- | :--- | :--- |
 | `<leader><space>` / `<leader>ff` | ファイル検索（Zig FFI / Snacks） | `snacks.picker` |
-| `<leader>/` / `<leader>sg` | プロジェクト全体の文字列 Grep（Zig SIMD） | `snacks.picker` |
+| `<leader>/` / `<leader>sg` | プロジェクト全体の文字列 Grep（Zig SIMD・`パターン  フィルタ` で結果を曖昧絞り込み） | `snacks.picker` |
 | `<leader>,` / `<leader>fb` | 開いているバッファ一覧 | `snacks.picker` |
 | `<leader>fr` | 最近開いたファイル | `snacks.picker` |
 | `<leader>sw` | カーソル下の単語 / 選択範囲を Grep | `snacks.picker` |
