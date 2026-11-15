@@ -97,6 +97,7 @@ if ffi_ok then
     int32_t core_fuzzy_add(uint64_t handle, const uint8_t *data, size_t length);
     int32_t core_fuzzy_query(uint64_t handle, const uint8_t *data, size_t length, uint32_t limit);
     const uint8_t *core_fuzzy_results(uint64_t handle, size_t *length);
+    uint64_t core_fuzzy_scanned(uint64_t handle);
     void core_fuzzy_destroy(uint64_t handle);
   ]]
   )
@@ -441,46 +442,82 @@ local function fuzzy_text(text, max_bytes)
   return text
 end
 
---- Fuzzy-filter `items` with the Zig engine shared with rufio (fuzzy.zig).
---- Each candidate is `item[key]` (default `item.text`). Returns the matching items,
---- best score first, or nil when the native library is unavailable.
+--- Create a reusable fuzzy session over `items` backed by a persistent Zig `Engine`
+--- (`core_fuzzy_create` + `core_fuzzy_add` once). Repeated `:query(filter, limit)` calls
+--- skip re-packing/re-validating in Lua and automatically narrow from the previous query
+--- when the new filter extends it.
 ---@param items table[]
----@param query string
----@param opts? { key?: string, limit?: number }
----@return table[]?
-function M.fuzzy_filter(items, query, opts)
+---@param opts? { key?: string }
+---@return { items: table[], handle: any, query: fun(self: table, filter: string, limit?: number): (table[]?), scanned: fun(self: table): number, close: fun(self: table) }?
+function M.create_fuzzy_session(items, opts)
   opts = opts or {}
   local engine = M.load()
   if not engine then
     return nil
   end
-  query = fuzzy_text(query or "", FUZZY_MAX_QUERY_BYTES)
-  if query == "" or #items == 0 then
-    return items
-  end
-  local key = opts.key or "text"
-  local limit = math.min(opts.limit or #items, FUZZY_MAX_RESULTS)
-
-  local handle = engine.core_fuzzy_create()
-  if handle == 0 then
+  local raw_handle = engine.core_fuzzy_create()
+  if raw_handle == 0 then
     return nil
   end
 
-  local ok, result = pcall(function()
+  -- Ensure the Zig engine is freed if the session is garbage-collected without `:close()`
+  local gc_handle = ffi.gc(ffi.cast("void *", raw_handle), function(ptr)
+    local h = tonumber(ffi.cast("uint64_t", ptr)) or 0
+    if h ~= 0 then
+      engine.core_fuzzy_destroy(h)
+    end
+  end)
+
+  if #items > 0 then
+    local key = opts.key or "text"
     local texts = {}
+    local needs_sanitize = false
     for i, item in ipairs(items) do
-      texts[i] = fuzzy_text(tostring(item[key] or ""), FUZZY_MAX_CANDIDATE_BYTES)
+      local s = tostring(item[key] or "")
+      if #s > FUZZY_MAX_CANDIDATE_BYTES or s:find("%z", 1, true) then
+        s = fuzzy_text(s, FUZZY_MAX_CANDIDATE_BYTES)
+        needs_sanitize = true
+      end
+      texts[i] = s
     end
     local packed = table.concat(texts, "\0") .. "\0"
-    if engine.core_fuzzy_add(handle, packed, #packed) ~= 0 then
-      return nil
+    -- Optimistically pass to Zig (`std.unicode.utf8ValidateSlice` in SIMD); only fall back
+    -- to per-item Lua `sanitize_utf8` if the batch actually contains invalid UTF-8 bytes.
+    if engine.core_fuzzy_add(raw_handle, packed, #packed) ~= 0 then
+      if not needs_sanitize then
+        for i, s in ipairs(texts) do
+          texts[i] = fuzzy_text(s, FUZZY_MAX_CANDIDATE_BYTES)
+        end
+        packed = table.concat(texts, "\0") .. "\0"
+      end
+      if engine.core_fuzzy_add(raw_handle, packed, #packed) ~= 0 then
+        ffi.gc(gc_handle, nil)
+        engine.core_fuzzy_destroy(raw_handle)
+        return nil
+      end
     end
-    if engine.core_fuzzy_query(handle, query, #query, limit) ~= 0 then
-      return nil
-    end
+  end
 
-    local len_buf = ffi.new("size_t[1]")
-    local ptr = engine.core_fuzzy_results(handle, len_buf)
+  local len_buf = ffi.new("size_t[1]")
+  local session = {
+    items = items,
+    handle = raw_handle,
+    _gc = gc_handle,
+  }
+
+  function session:query(filter, limit)
+    if self.handle == 0 then
+      return nil
+    end
+    filter = fuzzy_text(filter or "", FUZZY_MAX_QUERY_BYTES)
+    if filter == "" or #self.items == 0 then
+      return self.items
+    end
+    local max_res = math.min(limit or #self.items, FUZZY_MAX_RESULTS)
+    if engine.core_fuzzy_query(self.handle, filter, #filter, max_res) ~= 0 then
+      return nil
+    end
+    local ptr = engine.core_fuzzy_results(self.handle, len_buf)
     local total_len = tonumber(len_buf[0]) or 0
     if ptr == nil or total_len < 12 then
       return {}
@@ -495,17 +532,84 @@ function M.fuzzy_filter(items, query, opts)
       end
       local id = read_u64_low(ptr, pos)
       local n = read_u32(ptr, pos + 16)
-      out[#out + 1] = items[id + 1]
+      out[#out + 1] = self.items[id + 1]
       pos = pos + 20 + n * 4
     end
     return out
-  end)
+  end
 
-  engine.core_fuzzy_destroy(handle)
-  if not ok then
+  function session:scanned()
+    if self.handle == 0 then
+      return 0
+    end
+    return tonumber(engine.core_fuzzy_scanned(self.handle)) or 0
+  end
+
+  function session:close()
+    if self.handle ~= 0 then
+      ffi.gc(self._gc, nil)
+      engine.core_fuzzy_destroy(self.handle)
+      self.handle = 0
+    end
+  end
+
+  return session
+end
+
+-- Cached fuzzy session for `M.fuzzy_filter` (reused when the same `items` table & `key` are passed)
+local last_filter_cache = {
+  items = nil,
+  count = 0,
+  key = nil,
+  session = nil,
+}
+
+--- Fuzzy-filter `items` with the Zig engine shared with rufio (fuzzy.zig).
+--- Each candidate is `item[key]` (default `item.text`). Returns the matching items,
+--- best score first, or nil when the native library is unavailable.
+--- Reuses the underlying Zig fuzzy handle when called repeatedly on the same `items` table.
+---@param items table[]
+---@param query string
+---@param opts? { key?: string, limit?: number, session?: table }
+---@return table[]?
+function M.fuzzy_filter(items, query, opts)
+  opts = opts or {}
+  local engine = M.load()
+  if not engine then
     return nil
   end
-  return result
+  query = fuzzy_text(query or "", FUZZY_MAX_QUERY_BYTES)
+  if query == "" or #items == 0 then
+    return items
+  end
+  local key = opts.key or "text"
+  local limit = math.min(opts.limit or #items, FUZZY_MAX_RESULTS)
+
+  local session = opts.session
+  if not session then
+    if
+      last_filter_cache.session
+      and last_filter_cache.items == items
+      and last_filter_cache.count == #items
+      and last_filter_cache.key == key
+    then
+      session = last_filter_cache.session
+    else
+      if last_filter_cache.session then
+        last_filter_cache.session:close()
+      end
+      session = M.create_fuzzy_session(items, { key = key })
+      last_filter_cache.items = items
+      last_filter_cache.count = #items
+      last_filter_cache.key = key
+      last_filter_cache.session = session
+    end
+  end
+
+  if not session then
+    return nil
+  end
+  return session:query(query, limit)
 end
 
 --- Search file contents in `cwd` using Zig SIMD + in-memory cache (replaces `rg`)
@@ -604,8 +708,44 @@ function M.pick_files(opts)
   }, opts))
 end
 
+-- Cached Live Grep + Fuzzy state: while the literal `pattern`, `cwd`, and `max_items`
+-- remain unchanged (e.g. the user is typing/editing the fuzzy filter after `  `),
+-- reuse both the grep hits and the persistent Zig fuzzy index (enabling subsequence narrowing).
+local grep_fuzzy_state = {
+  pattern = nil,
+  cwd = nil,
+  max_items = nil,
+  items = nil,
+  session = nil,
+}
+
+--- Clear cached fuzzy sessions (releases native Zig fuzzy buffers).
+function M.clear_fuzzy_cache()
+  if grep_fuzzy_state.session then
+    grep_fuzzy_state.session:close()
+  end
+  grep_fuzzy_state = {
+    pattern = nil,
+    cwd = nil,
+    max_items = nil,
+    items = nil,
+    session = nil,
+  }
+  if last_filter_cache.session then
+    last_filter_cache.session:close()
+  end
+  last_filter_cache = {
+    items = nil,
+    count = 0,
+    key = nil,
+    session = nil,
+  }
+end
+
 --- Grep with the Zig engine, then fuzzy-filter the hits when the prompt contains
 --- `M.FUZZY_SEPARATOR` (`"pattern  filter"`). The filter matches `path:line:col:text`.
+--- When `pattern` is unchanged across consecutive calls, reuses both the grep hits
+--- and the native Zig fuzzy session so incremental typing narrows in sub-millisecond time.
 ---@param input string
 ---@param cwd? string
 ---@param max_items? number
@@ -614,9 +754,39 @@ function M.search_content_fuzzy(input, cwd, max_items)
   if pattern == "" then
     return {}
   end
-  local items = M.search_content(pattern, cwd, max_items)
+
+  local root = cwd or vim.fn.getcwd()
+  local cap = max_items or 5000
+
+  local same_grep = grep_fuzzy_state.pattern == pattern
+    and grep_fuzzy_state.cwd == root
+    and grep_fuzzy_state.max_items == cap
+    and grep_fuzzy_state.items ~= nil
+
+  local items
+  if same_grep then
+    items = grep_fuzzy_state.items
+  else
+    if grep_fuzzy_state.session then
+      grep_fuzzy_state.session:close()
+    end
+    items = M.search_content(pattern, root, cap)
+    grep_fuzzy_state.pattern = pattern
+    grep_fuzzy_state.cwd = root
+    grep_fuzzy_state.max_items = cap
+    grep_fuzzy_state.items = items
+    grep_fuzzy_state.session = nil
+  end
+
   if not items or filter == "" then
     return items
+  end
+
+  if not grep_fuzzy_state.session then
+    grep_fuzzy_state.session = M.create_fuzzy_session(items)
+  end
+  if grep_fuzzy_state.session then
+    return grep_fuzzy_state.session:query(filter) or items
   end
   return M.fuzzy_filter(items, filter) or items
 end
@@ -630,6 +800,7 @@ function M.pick_grep(opts)
   end
 
   local cwd = opts.cwd or vim.fn.getcwd()
+  local user_on_close = opts.on_close
   return Snacks.picker.pick(vim.tbl_extend("force", {
     source = "grep",
     title = "Grep (Zig SIMD + Cache)",
@@ -644,6 +815,12 @@ function M.pick_grep(opts)
         return {}
       end
       return M.search_content_fuzzy(search, cwd) or {}
+    end,
+    on_close = function(picker)
+      M.clear_fuzzy_cache()
+      if user_on_close then
+        user_on_close(picker)
+      end
     end,
   }, opts))
 end
