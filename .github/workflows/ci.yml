@@ -20,7 +20,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.17.0
 
       - name: Run Zig unit tests
         working-directory: zig
@@ -39,7 +39,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.17.0
 
       - name: Build Zig shared library
         working-directory: zig
